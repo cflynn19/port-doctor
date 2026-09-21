@@ -1,0 +1,32 @@
+{
+  "name": "port-doctor",
+  "version": "0.1.0",
+  "description": "Find out what's squatting on a port, and kill it.",
+  "author": "Connor Flynn",
+  "type": "module",
+  "bin": {
+    "port-doctor": "bin/port-doctor.js",
+    "pdoc": "bin/port-doctor.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test \"test/**/*.test.js\""
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "port",
+    "eaddrinuse",
+    "kill",
+    "lsof",
+    "cli",
+    "devtools"
+  ],
+  "license": "MIT"
+}
