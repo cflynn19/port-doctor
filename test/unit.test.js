@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
 
 import { parseArgs, parsePortArg } from '../src/cli.js';
-import { parseEtime } from '../src/proc.js';
-import { parseLsofFields, parseSsPids, portOf } from '../src/scan.js';
+import { parseEtime, parseWmiDate, basename } from '../src/proc.js';
+import { parseLsofFields, parseSsPids, portOf, scanListeners, isConnected } from '../src/scan.js';
 import { formatAge, truncate, confirm, setColor } from '../src/ui.js';
 
 setColor(false);
@@ -105,4 +105,156 @@ test('confirm resolves from a fake tty and returns null without one', async () =
   assert.equal(await ask('n\n'), false);
   assert.equal(await ask('\n'), false); // default is no
   assert.equal(await confirm('Kill it?', { input: new PassThrough(), output: new PassThrough() }), null);
+});
+
+/* ------------------------- scanListeners (injected) ----------------------- */
+
+/** A fake `run` that returns canned output and records every invocation. */
+function fakeRunner(responses) {
+  const calls = [];
+  const run = async (cmd, args) => {
+    calls.push({ cmd, args });
+    for (const [match, value] of responses) {
+      if (match(cmd, args)) {
+        if (value instanceof Error) throw value;
+        return value;
+      }
+    }
+    return '';
+  };
+  return { run, calls };
+}
+
+const enoent = () => Object.assign(new Error('spawn lsof ENOENT'), { code: 'ENOENT' });
+
+const lsofTcp = (cmd, args) => cmd === 'lsof' && args.includes('-iTCP');
+const lsofUdp = (cmd, args) => cmd === 'lsof' && args.includes('-iUDP');
+
+test('scanListeners buckets one payload across several ports', async () => {
+  const { run } = fakeRunner([
+    [lsofTcp, ['p48192', 'cnode', 'n*:3000', 'n127.0.0.1:5173', 'p99', 'cpostgres', 'n*:5432', ''].join('\n')],
+    [lsofUdp, ''],
+  ]);
+  const byPort = await scanListeners({ run, platform: 'darwin' });
+
+  assert.deepEqual([...byPort.keys()], [3000, 5173, 5432]);
+  assert.deepEqual(byPort.get(3000).map((h) => h.pid), [48192]);
+  assert.deepEqual(byPort.get(5173).map((h) => h.pid), [48192]);
+  assert.deepEqual(byPort.get(5432).map((h) => h.pid), [99]);
+  assert.deepEqual([...byPort.get(3000)[0].protocols], ['tcp']);
+});
+
+test('scanListeners costs the same two calls for 1 port as for 500', async () => {
+  const payload = ['p48192', 'cnode', 'n*:3000', ''].join('\n');
+  const one = fakeRunner([[lsofTcp, payload], [lsofUdp, '']]);
+  await scanListeners({ ports: [3000], run: one.run, platform: 'darwin' });
+
+  const many = fakeRunner([[lsofTcp, payload], [lsofUdp, '']]);
+  const ports = Array.from({ length: 500 }, (_, i) => 3000 + i);
+  const byPort = await scanListeners({ ports, run: many.run, platform: 'darwin' });
+
+  // Two calls (TCP + UDP) regardless of port count. Guards against anyone
+  // reintroducing a per-port scan loop.
+  assert.equal(one.calls.length, 2);
+  assert.equal(many.calls.length, 2);
+  assert.deepEqual([...byPort.keys()], [3000]);
+});
+
+test('scanListeners filters to the requested ports', async () => {
+  const { run } = fakeRunner([
+    [lsofTcp, ['p1', 'n*:3000', 'p2', 'n*:9999', ''].join('\n')],
+    [lsofUdp, ''],
+  ]);
+  const byPort = await scanListeners({ ports: [3000], run, platform: 'darwin' });
+  assert.deepEqual([...byPort.keys()], [3000]);
+});
+
+test('scanListeners ignores connected sockets, so a remote :443 is not a local listener', async () => {
+  // Regression: `lsof -iUDP` returns established flows too. Reading the trailing
+  // number off `...:51605->160.79.104.10:443` once made an outbound QUIC
+  // connection look like a local server on 443 — and --kill would signal it.
+  const { run } = fakeRunner([
+    [lsofTcp, ''],
+    [
+      lsofUdp,
+      ['p722', 'cGoogle Chrome Helper', 'n192.168.11.122:51605->160.79.104.10:443', 'n*:5353', ''].join('\n'),
+    ],
+  ]);
+  const byPort = await scanListeners({ run, platform: 'darwin' });
+
+  assert.equal(byPort.has(443), false, 'a remote port must never register as held');
+  assert.deepEqual([...byPort.keys()], [5353], 'the genuinely bound UDP port still shows');
+});
+
+test('isConnected distinguishes flows from listeners', () => {
+  assert.equal(isConnected('192.168.1.5:51605->160.79.104.10:443'), true);
+  assert.equal(isConnected('*:3000'), false);
+  assert.equal(isConnected('127.0.0.1:5432'), false);
+  assert.equal(isConnected(undefined), false);
+});
+
+test('scanListeners falls back to ss when lsof is missing', async () => {
+  const { run, calls } = fakeRunner([
+    [(cmd) => cmd === 'lsof', enoent()],
+    [(cmd, args) => cmd === 'ss' && args.includes('-ltnpH'), 'LISTEN 0 511 *:3000 *:* users:(("node",pid=48192,fd=20))'],
+    [(cmd, args) => cmd === 'ss' && args.includes('-lunpH'), ''],
+  ]);
+  const byPort = await scanListeners({ run, platform: 'linux' });
+
+  assert.ok(calls.some((k) => k.cmd === 'ss'), 'ss should be attempted');
+  assert.deepEqual(byPort.get(3000).map((h) => h.pid), [48192]);
+});
+
+test('scanListeners explains itself when neither lsof nor ss exists', async () => {
+  const { run } = fakeRunner([[() => true, enoent()]]);
+  await assert.rejects(() => scanListeners({ run, platform: 'linux' }), /Need `lsof` or `ss`/);
+});
+
+/* ----------------------------- windows paths ----------------------------- */
+
+test('scanListeners parses netstat output and keeps only LISTENING rows', async () => {
+  const netstat = [
+    'Active Connections',
+    '',
+    '  Proto  Local Address          Foreign Address        State           PID',
+    '  TCP    0.0.0.0:3000           0.0.0.0:0              LISTENING       48192',
+    '  TCP    127.0.0.1:52000        93.184.216.34:443      ESTABLISHED     7777',
+    '  TCPv6  [::]:5432              [::]:0                 LISTENING       99',
+    '  UDP    0.0.0.0:5353           *:*                                    1234',
+  ].join('\n');
+  const { run, calls } = fakeRunner([[(cmd) => cmd === 'netstat', netstat]]);
+  const byPort = await scanListeners({ run, platform: 'win32' });
+
+  assert.equal(calls.length, 1, 'one netstat call for the whole machine');
+  assert.deepEqual([...byPort.keys()], [3000, 5353, 5432]);
+  assert.equal(byPort.has(443), false, 'an ESTABLISHED row is not a listener');
+  assert.deepEqual([...byPort.get(5432)[0].protocols], ['tcp'], 'tcpv6 normalises to tcp');
+  assert.deepEqual([...byPort.get(5353)[0].protocols], ['udp']);
+});
+
+test('parseWmiDate reads both PowerShell date encodings', () => {
+  assert.equal(parseWmiDate('/Date(1700000000000)/'), 1700000000000);
+  assert.equal(parseWmiDate('2026-09-20T21:00:00.000Z'), Date.parse('2026-09-20T21:00:00.000Z'));
+  assert.equal(parseWmiDate('not a date'), null);
+  assert.equal(parseWmiDate(null), null);
+});
+
+test('basename handles both separators', () => {
+  assert.equal(basename('C:\\Program Files\\nodejs\\node.exe'), 'node.exe');
+  assert.equal(basename('/usr/local/bin/node'), 'node');
+  assert.equal(basename('node'), 'node');
+  assert.equal(basename(null), null);
+});
+
+/* --------------------------- assorted edge cases ------------------------- */
+
+test('truncate copes with budgets too small for an ellipsis', () => {
+  assert.equal(truncate('abcdef', 3), 'abc');
+  assert.equal(truncate('abcdef', 0), '');
+  assert.equal(truncate(null, 5), '');
+});
+
+test('formatAge does not emit negative durations', () => {
+  assert.equal(formatAge(-5), '0s');
+  assert.equal(formatAge(Number.NaN), 'unknown');
 });

@@ -133,18 +133,28 @@ Shape:
   decision made for you.
 - **Silently fail on someone else's process.** If the port belongs to another
   user, it says so and tells you it'll need `sudo`.
+- **Mistake a connection for a server.** UDP has no `LISTEN` state, so the socket
+  list also contains outbound flows like `192.168.1.5:51605->…:443`. The trailing
+  number there is the *remote* port; counting it would make an open browser tab
+  look like a local server on 443. Only bound sockets count.
+- **Kill a recycled PID.** The port is re-read immediately before signalling. If
+  the process exited in the meantime and the OS handed its PID to something else,
+  that PID is skipped rather than signalled.
 
 ## How it works
 
 | Platform | Discovery | Details |
 | --- | --- | --- |
-| macOS, Linux | `lsof -nP -iTCP:<port> -sTCP:LISTEN`, falling back to `ss` | `ps -o pid,ppid,user,etime,comm,command` |
+| macOS, Linux | `lsof -nP -iTCP -sTCP:LISTEN` + `-iUDP`, falling back to `ss -ltnpH`/`-lunpH` | `ps -o pid,ppid,user,etime,comm,command` |
 | Windows | `netstat -ano` | `Get-CimInstance Win32_Process` |
 
 Age comes from `ps -o etime`, which is elapsed wall-clock time — no timestamp
 parsing, no timezone bugs.
 
-Two `ps` invocations total, no matter how many PIDs are involved.
+Discovery is one pass over the machine's sockets, filtered in process. Two `lsof`
+calls and two `ps` calls total — whether you ask about one port or a
+thousand-port range, which is why `port-doctor 3000-3999` is as fast as
+`port-doctor 3000`.
 
 ## Development
 
@@ -152,9 +162,14 @@ Two `ps` invocations total, no matter how many PIDs are involved.
 npm test
 ```
 
-20 tests, no test framework. The end-to-end ones spawn real servers on real
+38 tests, no test framework. The end-to-end ones spawn real servers on real
 ephemeral ports and really kill them, including one that ignores `SIGTERM` to
 exercise the `--force` path.
+
+The unit tests inject a fake command runner, so the Windows `netstat` parsing is
+covered from any platform, and one test asserts that scanning 500 ports still
+costs exactly two calls — that is the guard against per-port scanning creeping
+back in.
 
 ## License
 

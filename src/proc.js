@@ -92,7 +92,7 @@ export function parseEtime(etime) {
 }
 
 /** PowerShell serialises CIM dates as `/Date(1700000000000)/` or ISO-8601. */
-function parseWmiDate(value) {
+export function parseWmiDate(value) {
   if (!value) return null;
   const epoch = /\/Date\((\d+)\)\//.exec(String(value));
   if (epoch) return Number(epoch[1]);
@@ -100,7 +100,7 @@ function parseWmiDate(value) {
   return Number.isNaN(t) ? null : t;
 }
 
-function basename(p) {
+export function basename(p) {
   if (!p) return null;
   const parts = p.split(/[\\/]/);
   return parts[parts.length - 1] || p;

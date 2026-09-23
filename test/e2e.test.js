@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -152,4 +153,84 @@ test('bad usage exits 2', async () => {
   const { code, stderr } = await cli(['banana']);
   assert.equal(code, 2);
   assert.match(stderr, /Not a port/);
+});
+
+test('--version reports the version from package.json, not a hardcoded literal', async () => {
+  const pkg = JSON.parse(
+    await readFile(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8')
+  );
+  const { code, stdout } = await cli(['--version']);
+  assert.equal(code, 0);
+  assert.equal(stdout.trim(), pkg.version);
+});
+
+test('the no-argument listing reports what is on the machine and exits 0', async () => {
+  const { server, port } = await listenHere();
+  try {
+    const { code, stdout } = await cli(['--json']);
+    assert.equal(code, 0);
+    const parsed = JSON.parse(stdout);
+    assert.ok(Array.isArray(parsed.ports));
+    assert.ok(
+      parsed.ports.some((p) => p.port === port),
+      `expected the listing to include the live port ${port}`
+    );
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test('a port range finds a listener inside it', async () => {
+  const { child, port } = await listenElsewhere();
+  try {
+    const { code, stdout } = await cli([`${port - 2}-${port + 2}`, '--json']);
+    assert.equal(code, 1, 'a range containing an occupied port is not all-free');
+    const parsed = JSON.parse(stdout);
+    assert.equal(parsed.ports.length, 5, 'every port in the range is reported');
+    const held = parsed.ports.filter((p) => !p.free);
+    assert.deepEqual(held.map((p) => p.port), [port]);
+    assert.deepEqual(held[0].processes.map((p) => p.pid), [child.pid]);
+  } finally {
+    child.kill('SIGKILL');
+  }
+});
+
+test('several ports in one invocation are reported independently', async () => {
+  const { child, port: busy } = await listenElsewhere();
+  const { server, port: free } = await listenHere();
+  await new Promise((r) => server.close(r));
+  try {
+    const { code, stdout } = await cli([String(busy), String(free), '--json']);
+    assert.equal(code, 1, 'one occupied port means a non-zero exit overall');
+    const parsed = JSON.parse(stdout);
+    const byPort = new Map(parsed.ports.map((p) => [p.port, p]));
+    assert.equal(byPort.get(busy).free, false);
+    assert.equal(byPort.get(free).free, true);
+    assert.deepEqual(byPort.get(free).processes, []);
+  } finally {
+    child.kill('SIGKILL');
+  }
+});
+
+test('--json alone never kills anything', async () => {
+  const { child, port } = await listenElsewhere();
+  try {
+    const { code } = await cli([String(port), '--json']);
+    assert.equal(code, 1);
+    await sleep(100);
+    assert.ok(isAlive(child.pid), '--json without --kill must leave the process running');
+    assert.deepEqual(
+      (await findHolders(port)).map((h) => h.pid),
+      [child.pid],
+      'and the port is still held'
+    );
+  } finally {
+    child.kill('SIGKILL');
+  }
+});
+
+test('a non-numeric --timeout exits 2', async () => {
+  const { code, stderr } = await cli(['3000', '--timeout', 'soon']);
+  assert.equal(code, 2);
+  assert.match(stderr, /milliseconds/);
 });

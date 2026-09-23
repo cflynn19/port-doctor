@@ -1,9 +1,14 @@
-import { findHolders, findAllListeners } from './scan.js';
+import { createRequire } from 'node:module';
+
+import { scanListeners, findAllListeners } from './scan.js';
 import { describe, selfAncestry, isAlive } from './proc.js';
 import { killProcess } from './kill.js';
 import { c, setColor, shouldUseColor, formatAge, truncate, detailBlock, confirm } from './ui.js';
 
-const VERSION = '0.1.0';
+// Read from package.json rather than restating it, so `--version` cannot drift.
+// `createRequire` instead of a JSON import attribute: attributes are unavailable
+// on Node 18, which is the floor declared in `engines`.
+const { version: VERSION } = createRequire(import.meta.url)('../package.json');
 const isWin = process.platform === 'win32';
 const SYM = isWin ? { ok: '+', bad: 'x', info: '-' } : { ok: '✔', bad: '✖', info: '•' };
 
@@ -77,9 +82,13 @@ async function diagnose(opts) {
   const protectedPids = await selfAncestry();
   const report = [];
 
+  // Scan and describe up front: two `lsof` calls and two `ps` calls total,
+  // whether that is one port or a thousand-port range.
+  const byPort = await scanListeners({ ports: opts.ports });
+  const details = await describe([...byPort.values()].flat().map((h) => h.pid));
+
   for (const port of opts.ports) {
-    const holders = await findHolders(port);
-    const details = await describe(holders.map((h) => h.pid));
+    const holders = byPort.get(port) ?? [];
     const processes = holders.map((h) => ({
       ...details.get(h.pid),
       pid: h.pid,
@@ -100,7 +109,7 @@ async function diagnose(opts) {
 
     const decision = opts.kill ? 'yes' : await askToKill(port, processes, opts, protectedPids);
     if (decision === 'yes') {
-      await killAll(processes, opts, protectedPids);
+      await killAll(port, processes, opts, protectedPids);
       const stillHeld = processes.some((p) => p.killed === false);
       report.push({ port, free: !stillHeld, processes });
     } else {
@@ -222,7 +231,12 @@ async function askToKill(port, processes, opts, protectedPids) {
   return answer ? 'yes' : 'no';
 }
 
-async function killAll(processes, opts, protectedPids) {
+async function killAll(port, processes, opts, protectedPids) {
+  // The scan happened a moment ago. Re-read the port so a holder that has since
+  // exited cannot get its pid recycled onto an unrelated process that we then
+  // signal. Cheap now that a scan is a single pass.
+  const stillHolding = new Set((await scanListeners({ ports: [port] })).get(port)?.map((h) => h.pid) ?? []);
+
   for (const p of processes) {
     if (protectedPids.has(p.pid) || p.pid === 1) {
       p.killed = false;
@@ -232,6 +246,13 @@ async function killAll(processes, opts, protectedPids) {
     }
     if (!isAlive(p.pid)) {
       p.killed = true;
+      continue;
+    }
+    if (!stillHolding.has(p.pid)) {
+      // Alive, but no longer on this port — so this pid is not our business.
+      p.killed = true;
+      p.error = `skipped: pid ${p.pid} no longer holds port ${port}`;
+      if (!opts.json) process.stdout.write(`${c.dim(`${SYM.info} ${p.error}`)}\n`);
       continue;
     }
     const result = await killProcess(p.pid, { force: opts.force, timeoutMs: opts.timeout });
