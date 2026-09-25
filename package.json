@@ -15,8 +15,17 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test \"test/**/*.test.js\""
+    "test": "node --test \"test/**/*.test.js\"",
+    "prepublishOnly": "npm test"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cflynn19/port-doctor.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cflynn19/port-doctor/issues"
+  },
+  "homepage": "https://github.com/cflynn19/port-doctor#readme",
   "engines": {
     "node": ">=18"
   },
