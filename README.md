@@ -69,7 +69,7 @@ It takes whatever you have on your clipboard — `3000`, `:3000`, `localhost:300
 | Code | Meaning |
 | --- | --- |
 | `0` | Every requested port ended up free |
-| `1` | A port is still occupied — you declined, or the kill failed |
+| `1` | A port is still occupied — you declined, the kill failed, or something respawned onto it |
 | `2` | Bad usage, or no way to inspect ports on this machine |
 
 So this works:
@@ -156,13 +156,17 @@ calls and two `ps` calls total — whether you ask about one port or a
 thousand-port range, which is why `port-doctor 3000-3999` is as fast as
 `port-doctor 3000`.
 
+Killing adds one more read per port actually killed, to confirm the process still
+holds the port before it gets signalled. That is a deliberate cost: it is what
+makes the recycled-PID guarantee above true.
+
 ## Development
 
 ```bash
 npm test
 ```
 
-38 tests, no test framework. The end-to-end ones spawn real servers on real
+47 tests, no test framework. The end-to-end ones spawn real servers on real
 ephemeral ports and really kill them, including one that ignores `SIGTERM` to
 exercise the `--force` path.
 

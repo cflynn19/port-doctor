@@ -1,4 +1,4 @@
-import { run } from './exec.js';
+import { run as defaultRun } from './exec.js';
 
 const isWin = process.platform === 'win32';
 
@@ -38,7 +38,7 @@ async function describeUnix(pids, out) {
   const list = pids.join(',');
 
   // Two calls: fixed-width-ish fields first, then the free-form command line.
-  const meta = await run('ps', ['-o', 'pid=,ppid=,user=,etime=,comm=', '-p', list]);
+  const meta = await defaultRun('ps', ['-o', 'pid=,ppid=,user=,etime=,comm=', '-p', list]);
   for (const line of meta.split('\n')) {
     const m = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*)$/.exec(line);
     if (!m) continue;
@@ -50,7 +50,7 @@ async function describeUnix(pids, out) {
     info.name = basename(m[5].trim());
   }
 
-  const cmds = await run('ps', ['-o', 'pid=,command=', '-p', list]);
+  const cmds = await defaultRun('ps', ['-o', 'pid=,command=', '-p', list]);
   for (const line of cmds.split('\n')) {
     const m = /^\s*(\d+)\s+(.*)$/.exec(line);
     if (!m) continue;
@@ -67,7 +67,7 @@ async function describeWindows(pids, out) {
     '| Select-Object ProcessId,ParentProcessId,Name,CommandLine,CreationDate',
     '| ConvertTo-Json -Compress -Depth 2',
   ].join(' ');
-  const raw = await run('powershell', ['-NoProfile', '-NonInteractive', '-Command', script]);
+  const raw = await defaultRun('powershell', ['-NoProfile', '-NonInteractive', '-Command', script]);
   const text = raw.trim();
   if (!text) return;
   const parsed = JSON.parse(text);
@@ -116,18 +116,27 @@ export function isAlive(pid) {
   }
 }
 
-/** Walk up the ppid chain from the current process so we never kill our own shell. */
-export async function selfAncestry() {
-  const chain = new Set([process.pid, process.ppid]);
-  if (isWin) return chain;
+/**
+ * Walk up the ppid chain from the current process so we never kill our own shell.
+ *
+ * Every platform walks the whole chain. Windows used to stop at `ppid`, which
+ * left a grandparent shell killable — and `taskkill` is the more destructive of
+ * the two backends, so that was the wrong place to cut the corner.
+ *
+ * @param {{ run?: typeof defaultRun, platform?: string, pid?: number, ppid?: number }} [options]
+ *   Injectable so tests can walk a synthetic tree on any host.
+ * @returns {Promise<Set<number>>}
+ */
+export async function selfAncestry({
+  run = defaultRun,
+  platform = process.platform,
+  pid = process.pid,
+  ppid = process.ppid,
+} = {}) {
+  const chain = new Set([pid, ppid]);
   try {
-    const out = await run('ps', ['-eo', 'pid=,ppid=']);
-    const parents = new Map();
-    for (const line of out.split('\n')) {
-      const m = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
-      if (m) parents.set(Number(m[1]), Number(m[2]));
-    }
-    let cur = process.pid;
+    const parents = platform === 'win32' ? await parentMapWindows(run) : await parentMapUnix(run);
+    let cur = pid;
     for (let i = 0; i < 64 && cur && cur > 1; i += 1) {
       cur = parents.get(cur);
       if (!cur) break;
@@ -137,5 +146,57 @@ export async function selfAncestry() {
     // Best effort only.
   }
   chain.delete(0);
+  chain.delete(undefined);
   return chain;
+}
+
+/** pid -> ppid for every process, from `ps`. */
+async function parentMapUnix(run) {
+  const out = await run('ps', ['-eo', 'pid=,ppid=']);
+  const parents = new Map();
+  for (const line of out.split('\n')) {
+    const m = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+    if (m) parents.set(Number(m[1]), Number(m[2]));
+  }
+  return parents;
+}
+
+/**
+ * pid -> ppid for every process, from PowerShell.
+ *
+ * Windows does not clear `ParentProcessId` when a parent exits, and it recycles
+ * pids aggressively, so the raw pointer can name an unrelated live process. Left
+ * unchecked the ancestry walk would climb into that stranger's branch and mark
+ * it protected — which, since `--force` deliberately cannot override protection,
+ * would leave a port with no way to free it. A parent is always older than its
+ * child, so a younger "parent" is a stale pointer and the edge gets dropped.
+ */
+async function parentMapWindows(run) {
+  const script = [
+    'Get-CimInstance Win32_Process',
+    '| Select-Object ProcessId,ParentProcessId,CreationDate',
+    '| ConvertTo-Json -Compress -Depth 2',
+  ].join(' ');
+  const raw = await run('powershell', ['-NoProfile', '-NonInteractive', '-Command', script]);
+  const text = String(raw ?? '').trim();
+  if (!text) return new Map();
+
+  const parsed = JSON.parse(text);
+  const rows = new Map();
+  for (const row of Array.isArray(parsed) ? parsed : [parsed]) {
+    const child = Number(row.ProcessId);
+    const parent = Number(row.ParentProcessId);
+    if (Number.isInteger(child) && Number.isInteger(parent)) {
+      rows.set(child, { ppid: parent, created: parseWmiDate(row.CreationDate) });
+    }
+  }
+
+  const parents = new Map();
+  for (const [pid, { ppid, created }] of rows) {
+    const parent = rows.get(ppid);
+    // Only reject on positive evidence: absent timestamps keep the edge.
+    if (parent && created != null && parent.created != null && parent.created > created) continue;
+    parents.set(pid, ppid);
+  }
+  return parents;
 }

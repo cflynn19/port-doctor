@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
 
-import { parseArgs, parsePortArg } from '../src/cli.js';
-import { parseEtime, parseWmiDate, basename } from '../src/proc.js';
+import { parseArgs, parsePortArg, portFreedom } from '../src/cli.js';
+import { parseEtime, parseWmiDate, basename, selfAncestry } from '../src/proc.js';
 import { parseLsofFields, parseSsPids, portOf, scanListeners, isConnected } from '../src/scan.js';
 import { formatAge, truncate, confirm, setColor } from '../src/ui.js';
 
@@ -257,4 +257,101 @@ test('truncate copes with budgets too small for an ellipsis', () => {
 test('formatAge does not emit negative durations', () => {
   assert.equal(formatAge(-5), '0s');
   assert.equal(formatAge(Number.NaN), 'unknown');
+});
+
+/* ----------------------------- self-protection --------------------------- */
+
+// pid 100 (the CLI) <- 90 (node) <- 80 (the shell) <- 1
+const WIN_TREE = JSON.stringify([
+  { ProcessId: 100, ParentProcessId: 90 },
+  { ProcessId: 90, ParentProcessId: 80 },
+  { ProcessId: 80, ParentProcessId: 1 },
+]);
+const UNIX_TREE = ['  100    90', '   90    80', '   80     1', '    1     0'].join('\n');
+
+test('selfAncestry walks the whole chain on unix', async () => {
+  const { run } = fakeRunner([[(cmd) => cmd === 'ps', UNIX_TREE]]);
+  const chain = await selfAncestry({ run, platform: 'linux', pid: 100, ppid: 90 });
+  assert.deepEqual([...chain].sort((a, b) => a - b), [1, 80, 90, 100]);
+});
+
+test('selfAncestry walks the whole chain on windows too', async () => {
+  // Regression: Windows used to return only {pid, ppid}, leaving the grandparent
+  // shell (80) killable — and taskkill is the more destructive backend.
+  const { run, calls } = fakeRunner([[(cmd) => cmd === 'powershell', WIN_TREE]]);
+  const chain = await selfAncestry({ run, platform: 'win32', pid: 100, ppid: 90 });
+
+  assert.equal(calls[0].cmd, 'powershell', 'windows asks PowerShell for the tree');
+  assert.ok(chain.has(80), 'the grandparent shell must be protected');
+  assert.deepEqual([...chain].sort((a, b) => a - b), [1, 80, 90, 100]);
+});
+
+test('selfAncestry still protects the immediate pair when the tree lookup fails', async () => {
+  const { run } = fakeRunner([[() => true, new Error('boom')]]);
+  const chain = await selfAncestry({ run, platform: 'win32', pid: 100, ppid: 90 });
+  assert.deepEqual([...chain].sort((a, b) => a - b), [90, 100], 'degrades, never empties');
+});
+
+test('selfAncestry tolerates a single-object PowerShell response', async () => {
+  // ConvertTo-Json emits a bare object, not an array, for one row.
+  const { run } = fakeRunner([[(cmd) => cmd === 'powershell', JSON.stringify({ ProcessId: 100, ParentProcessId: 90 })]]);
+  const chain = await selfAncestry({ run, platform: 'win32', pid: 100, ppid: 90 });
+  assert.ok(chain.has(90));
+});
+
+/* --------------------------- post-kill port state ------------------------- */
+
+test('portFreedom reports free only when the port really is', () => {
+  // The holder was killed and nothing replaced it.
+  assert.deepEqual(portFreedom([{ pid: 100, killed: true }], new Set([100])), {
+    free: true,
+    strangers: [],
+  });
+
+  // A kill failed.
+  assert.deepEqual(portFreedom([{ pid: 100, killed: false }], new Set([100])), {
+    free: false,
+    strangers: [],
+  });
+
+  // Skipped (killed undefined) and the port is genuinely empty now.
+  assert.deepEqual(portFreedom([{ pid: 100 }], new Set()), { free: true, strangers: [] });
+});
+
+test('portFreedom catches a respawn taking over a skipped holder', () => {
+  // Regression: a skipped pid used to be recorded as killed, so this reported
+  // free with exit 0 while pid 200 still held the port.
+  assert.deepEqual(portFreedom([{ pid: 100 }], new Set([200])), {
+    free: false,
+    strangers: [200],
+  });
+});
+
+test('portFreedom falls back to kill results when the port cannot be re-read', () => {
+  assert.deepEqual(portFreedom([{ pid: 100, killed: true }], null), { free: true, strangers: [] });
+  assert.deepEqual(portFreedom([{ pid: 100, killed: false }], null), { free: false, strangers: [] });
+});
+
+test('selfAncestry drops a stale Windows parent pointer instead of protecting a stranger', () => {
+  // Windows keeps ParentProcessId after the parent dies and reuses pids, so 80
+  // here is an unrelated process that merely inherited the number. Climbing into
+  // it would mark a stranger protected — and --force cannot override protection,
+  // so the user would have no way to free the port.
+  const stale = JSON.stringify([
+    { ProcessId: 100, ParentProcessId: 90, CreationDate: '/Date(300)/' },
+    { ProcessId: 90, ParentProcessId: 80, CreationDate: '/Date(200)/' },
+    { ProcessId: 80, ParentProcessId: 1, CreationDate: '/Date(400)/' }, // younger than its "child"
+  ]);
+  const { run } = fakeRunner([[(cmd) => cmd === 'powershell', stale]]);
+  return selfAncestry({ run, platform: 'win32', pid: 100, ppid: 90 }).then((chain) => {
+    assert.equal(chain.has(80), false, 'a younger "parent" is a recycled pid, not an ancestor');
+    assert.deepEqual([...chain].sort((a, b) => a - b), [90, 100]);
+  });
+});
+
+test('selfAncestry keeps the chain when Windows omits creation dates', async () => {
+  // No timestamps means no evidence of staleness, so edges must survive.
+  const { run } = fakeRunner([[(cmd) => cmd === 'powershell', WIN_TREE]]);
+  const chain = await selfAncestry({ run, platform: 'win32', pid: 100, ppid: 90 });
+  assert.ok(chain.has(80), 'absent dates must not cause under-protection');
 });

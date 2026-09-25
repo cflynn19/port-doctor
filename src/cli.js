@@ -87,6 +87,24 @@ async function diagnose(opts) {
   const byPort = await scanListeners({ ports: opts.ports });
   const details = await describe([...byPort.values()].flat().map((h) => h.pid));
 
+  // Who holds this port *right now* — read immediately before signalling, so a
+  // pid that exited and had its number recycled is not mistaken for the original
+  // holder. Deliberately per-port and never cached: a shared read goes stale as
+  // earlier ports are killed, and staleness is the one thing this guard exists to
+  // avoid. The cost is a single scan per port actually killed, which is dwarfed
+  // by the SIGTERM wait that follows it.
+  //
+  // Returns null when the read fails: unverifiable, so fall back to trusting the
+  // original scan rather than aborting a run that is already half done.
+  const holdersNow = async (port) => {
+    try {
+      const fresh = await scanListeners({ ports: [port] });
+      return new Set((fresh.get(port) ?? []).map((h) => h.pid));
+    } catch {
+      return null;
+    }
+  };
+
   for (const port of opts.ports) {
     const holders = byPort.get(port) ?? [];
     const processes = holders.map((h) => ({
@@ -109,9 +127,16 @@ async function diagnose(opts) {
 
     const decision = opts.kill ? 'yes' : await askToKill(port, processes, opts, protectedPids);
     if (decision === 'yes') {
-      await killAll(port, processes, opts, protectedPids);
-      const stillHeld = processes.some((p) => p.killed === false);
-      report.push({ port, free: !stillHeld, processes });
+      const stillHolding = await holdersNow(port);
+      await killAll(port, processes, opts, protectedPids, stillHolding);
+
+      const { free, strangers } = portFreedom(processes, stillHolding);
+      if (strangers.length && !opts.json) {
+        process.stdout.write(
+          `${c.yellow(`${SYM.bad} Port ${c.bold(port)} is still held by ${strangers.join(', ')} — something respawned it.`)}\n`
+        );
+      }
+      report.push({ port, free, processes });
     } else {
       if (decision === 'no') printSkipHint(port, opts);
       report.push({ port, free: false, processes });
@@ -231,12 +256,28 @@ async function askToKill(port, processes, opts, protectedPids) {
   return answer ? 'yes' : 'no';
 }
 
-async function killAll(port, processes, opts, protectedPids) {
-  // The scan happened a moment ago. Re-read the port so a holder that has since
-  // exited cannot get its pid recycled onto an unrelated process that we then
-  // signal. Cheap now that a scan is a single pass.
-  const stillHolding = new Set((await scanListeners({ ports: [port] })).get(port)?.map((h) => h.pid) ?? []);
+/**
+ * Did the port actually end up free?
+ *
+ * Kill results alone are not enough. A holder we skipped may have been replaced
+ * by a respawn (nodemon, pm2, a shell loop), so the port stays occupied by a pid
+ * we never signalled — reporting that as free would send exit 0 to a script like
+ * `port-doctor 3000 --kill && npm run dev`, which then hits EADDRINUSE anyway.
+ *
+ * @param {Array<{ pid: number, killed?: boolean }>} processes
+ * @param {Set<number>|null} stillHolding fresh holders, or null if unverifiable
+ * @returns {{ free: boolean, strangers: number[] }}
+ */
+export function portFreedom(processes, stillHolding) {
+  const failed = processes.some((p) => p.killed === false);
+  const strangers = stillHolding
+    ? [...stillHolding].filter((pid) => !processes.some((p) => p.pid === pid))
+    : [];
+  return { free: !failed && strangers.length === 0, strangers };
+}
 
+/** @param {Set<number>|null} stillHolding fresh holders, or null if unverifiable */
+async function killAll(port, processes, opts, protectedPids, stillHolding) {
   for (const p of processes) {
     if (protectedPids.has(p.pid) || p.pid === 1) {
       p.killed = false;
@@ -248,9 +289,10 @@ async function killAll(port, processes, opts, protectedPids) {
       p.killed = true;
       continue;
     }
-    if (!stillHolding.has(p.pid)) {
-      // Alive, but no longer on this port — so this pid is not our business.
-      p.killed = true;
+    if (stillHolding && !stillHolding.has(p.pid)) {
+      // Alive, but no longer on this port, so this pid is not our business.
+      // `killed` stays undefined: nothing was signalled, and claiming otherwise
+      // would report the port free when a respawn may already hold it.
       p.error = `skipped: pid ${p.pid} no longer holds port ${port}`;
       if (!opts.json) process.stdout.write(`${c.dim(`${SYM.info} ${p.error}`)}\n`);
       continue;

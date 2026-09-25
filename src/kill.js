@@ -40,7 +40,10 @@ export async function killProcess(pid, { force = false, timeoutMs = 3000 } = {})
 }
 
 async function killWindows(pid, force) {
-  const args = ['/PID', String(pid), '/T'];
+  // Deliberately no `/T`. That kills the whole process tree, which made Windows
+  // silently more destructive than the Unix path's single-process signal. One
+  // port, one process.
+  const args = ['/PID', String(pid)];
   if (force) args.push('/F');
   try {
     await run('taskkill', args);
